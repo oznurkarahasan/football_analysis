@@ -1,2 +1,24 @@
-*__pycahce__*
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# C++ / CMake build outputs
+cpp_port/build/
+cpp_port/CMakeFiles/
+cpp_port/CMakeCache.txt
+cpp_port/cmake_install.cmake
+cpp_port/Makefile
+
+# Local binary assets (keep placeholder text files)
+models/*.onnx
+cpp_port/models/*.onnx
+input_videos/*.mp4
+output_videos/*.mp4
+cpp_port/*.mp4
+
+# Optional local editor/system files
+.DS_Store
 *.pyc
