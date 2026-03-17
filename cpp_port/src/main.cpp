@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "football_analysis/byte_track_lite.hpp"
+#include "football_analysis/camera_motion_estimator.hpp"
 
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
@@ -433,14 +434,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // --- 1. GECiS: Tum frame'leri oku + YOLO tespitlerini topla (ByteTrack yok) ---
+    // Kamera hareketi tahmin edilmeden once tracking yapilmamali.
+    // Python da ayni sekilde once tum frame'leri alip sonra isliyordu.
+
+    struct RawFrameDetections {
+        std::vector<HumanDetection> humans;  // trackId=-1, ham tespitler
+        std::optional<Detection> ball;
+    };
+
     std::vector<cv::Mat> frames;
-    std::vector<std::vector<HumanDetection>> humansPerFrame;
-    std::vector<std::optional<Detection>> ballPerFrame;
+    std::vector<RawFrameDetections> rawPerFrame;
 
     cv::Mat frame;
     int totalBallDetections = 0;
     int totalHumanDetections = 0;
-    fa::ByteTrackLite humanTracker(0.45f, 0.10f, 0.30f, 0.20f, 30);
 
     while (cap.read(frame)) {
         LetterboxInfo letterbox{};
@@ -457,6 +465,8 @@ int main(int argc, char** argv) {
         std::vector<cv::Mat> outputs;
         net.forward(outputs, net.getUnconnectedOutLayersNames());
 
+        RawFrameDetections raw{};
+
         if (!outputs.empty()) {
             const auto detections = decodeYoloOutput(
                 outputs[0],
@@ -466,9 +476,6 @@ int main(int argc, char** argv) {
                 frame.cols,
                 frame.rows);
 
-            std::vector<HumanDetection> humans;
-            std::optional<Detection> frameBall;
-
             for (const auto& det : detections) {
                 int mappedClassId = det.classId;
                 if (mappedClassId == classMapping.goalkeeperId) {
@@ -477,39 +484,89 @@ int main(int argc, char** argv) {
 
                 if (isHumanClass(mappedClassId, classMapping)) {
                     ++totalHumanDetections;
-                    humans.push_back(HumanDetection{-1, mappedClassId, det.confidence, det.box, false});
+                    raw.humans.push_back(HumanDetection{-1, mappedClassId, det.confidence, det.box, false});
                 } else if (mappedClassId == classMapping.ballId) {
-                    if (!frameBall.has_value() || det.confidence > frameBall->confidence) {
-                        frameBall = Detection{mappedClassId, det.confidence, det.box};
+                    if (!raw.ball.has_value() || det.confidence > raw.ball->confidence) {
+                        raw.ball = Detection{mappedClassId, det.confidence, det.box};
                     }
                 }
             }
 
-            if (frameBall.has_value()) {
+            if (raw.ball.has_value()) {
                 ++totalBallDetections;
             }
+        }
 
-            auto trackedHumans = humanTracker.update(humans);
-            if (frameBall.has_value()) {
-                const int assignedTrack = assignBallToClosestPlayer(trackedHumans, frameBall->box, classMapping.playerId, 70.0f);
-                if (assignedTrack != -1) {
-                    for (auto& h : trackedHumans) {
-                        if (h.trackId == assignedTrack) {
-                            h.hasBall = true;
-                            break;
-                        }
+        frames.push_back(frame.clone());
+        rawPerFrame.push_back(std::move(raw));
+    }
+
+    // --- 2. GECiS: Kamera hareketi tahmini ---
+    // Python'daki camera_movement_estimator.get_camera_movement() karsiligi.
+    // Lucas-Kanade optical flow ile frame kenarlarindan kamera deplasmanini hesapla.
+    std::cout << "Kamera hareketi tahmin ediliyor (" << frames.size() << " frame)...\n";
+    fa::CameraMotionEstimator cameraEstimator;
+    const std::vector<cv::Point2f> cameraMotion = cameraEstimator.estimate(frames);
+
+    // --- 3. GECiS: Kamera kompanzasyonu + ByteTrack + top sahipligi ---
+    // Tespit kutularini kamera hareketine gore duzelttikten sonra tracker'a ver.
+    // ByteTrack kamera sapması olmadan tutarli IOU eslesmeleri yapabilsin.
+    // Goruntu cizimi icin kutular orijinal koordinatlara geri cevrilir.
+
+    std::vector<std::vector<HumanDetection>> humansPerFrame;
+    std::vector<std::optional<Detection>> ballPerFrame;
+
+    fa::ByteTrackLite humanTracker(0.45f, 0.10f, 0.30f, 0.20f, 30);
+
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        auto humans = rawPerFrame[i].humans;
+        auto ball = rawPerFrame[i].ball;
+
+        // Kamera deplasmanini tespit kutularindan cikar (piksel olarak yuvarla)
+        const int dxi = static_cast<int>(std::round(cameraMotion[i].x));
+        const int dyi = static_cast<int>(std::round(cameraMotion[i].y));
+
+        if (dxi != 0 || dyi != 0) {
+            for (auto& h : humans) {
+                h.box.x -= dxi;
+                h.box.y -= dyi;
+            }
+            if (ball.has_value()) {
+                ball->box.x -= dxi;
+                ball->box.y -= dyi;
+            }
+        }
+
+        // ByteTrack: kompanze edilmis koordinatlar uzerinde calistir
+        auto tracked = humanTracker.update(humans);
+
+        // Goruntu cizimleri icin orijinal frame koordinatlarına geri al
+        if (dxi != 0 || dyi != 0) {
+            for (auto& h : tracked) {
+                h.box.x += dxi;
+                h.box.y += dyi;
+            }
+            if (ball.has_value()) {
+                ball->box.x += dxi;
+                ball->box.y += dyi;
+            }
+        }
+
+        // Top sahipligi atamasi (orijinal koordinatlarla)
+        if (ball.has_value()) {
+            const int assignedTrack = assignBallToClosestPlayer(tracked, ball->box, classMapping.playerId, 70.0f);
+            if (assignedTrack != -1) {
+                for (auto& h : tracked) {
+                    if (h.trackId == assignedTrack) {
+                        h.hasBall = true;
+                        break;
                     }
                 }
             }
-
-            frames.push_back(frame.clone());
-            humansPerFrame.push_back(std::move(trackedHumans));
-            ballPerFrame.push_back(frameBall);
-        } else {
-            frames.push_back(frame.clone());
-            humansPerFrame.emplace_back();
-            ballPerFrame.push_back(std::nullopt);
         }
+
+        humansPerFrame.push_back(std::move(tracked));
+        ballPerFrame.push_back(ball);
     }
 
     interpolateBallDetections(ballPerFrame);

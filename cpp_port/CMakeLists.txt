@@ -5,16 +5,18 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio dnn)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio dnn video)
 
 add_library(football_analysis_core
     src/ball_trajectory_filler.cpp
     src/possession_assigner.cpp
     src/speed_distance_estimator.cpp
     src/pipeline.cpp
+    src/camera_motion_estimator.cpp
 )
 
-target_include_directories(football_analysis_core PUBLIC include)
+target_include_directories(football_analysis_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(football_analysis_core PUBLIC ${OpenCV_LIBS})
 
 add_executable(football_analysis_app
     src/main.cpp
