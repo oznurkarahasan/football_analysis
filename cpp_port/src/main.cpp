@@ -371,7 +371,11 @@ std::vector<Detection> decodeYoloOutput(
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Kullanim: " << argv[0]
-                  << " <model.onnx> <input_video> [output_video] [ball_id player_id goalkeeper_id referee_id]\n";
+                  << " <model.onnx> <input_video> [output_video]"
+                     " [ball_id player_id goalkeeper_id referee_id]"
+                     " [x1 y1 x2 y2 x3 y3 x4 y4]\n"
+                     "  Son 8 arg: homografi icin sahada 4 piksel kose noktasi.\n"
+                     "  Verilmezse dunya koordinati overlay'i devre disi olur.\n";
         return 1;
     }
 
@@ -390,6 +394,33 @@ int main(int argc, char** argv) {
             std::cerr << "Sinif id argumanlari sayi olmali.\n";
             return 1;
         }
+    }
+
+    // Homografi: argv[8..15] olarak 8 float (4 piksel kose noktasi) alinir.
+    // Verilmezse dunya koordinati hesabi ve overlay'i tamamen devre disi kalir.
+    // Farkli kamera acilari icin pixel koselerini o videoya gore geciriniz.
+    std::optional<fa::HomographyTransformer> homography;
+    if (argc >= 16) {
+        try {
+            const std::array<cv::Point2f, 4> pixelVertices = {
+                cv::Point2f(std::stof(argv[8]),  std::stof(argv[9])),
+                cv::Point2f(std::stof(argv[10]), std::stof(argv[11])),
+                cv::Point2f(std::stof(argv[12]), std::stof(argv[13])),
+                cv::Point2f(std::stof(argv[14]), std::stof(argv[15])),
+            };
+            const std::array<cv::Point2f, 4> targetVertices = {
+                cv::Point2f(0.0f,   68.0f),
+                cv::Point2f(0.0f,    0.0f),
+                cv::Point2f(23.32f,  0.0f),
+                cv::Point2f(23.32f, 68.0f),
+            };
+            homography.emplace(pixelVertices, targetVertices);
+            std::cout << "Homografi aktif (4 piksel kose noktasi kullanicidan alindi).\n";
+        } catch (const std::exception&) {
+            std::cerr << "Homografi noktalari gecersiz float degil, devre disi birakildi.\n";
+        }
+    } else {
+        std::cout << "Homografi devre disi (pixel kose noktalari verilmedi).\n";
     }
 
     if (!std::filesystem::exists(modelPath)) {
@@ -420,9 +451,12 @@ int main(int argc, char** argv) {
     const int frameHeight = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
     const double fps = cap.get(cv::CAP_PROP_FPS) > 0.0 ? cap.get(cv::CAP_PROP_FPS) : 25.0;
 
-    const int inputSize = 640;
-    const float confThreshold = 0.10f;
+    const int inputSize = 1280;
+    const float confThreshold = 0.10f;   // insan/hakem icin minimum guven
     const float nmsThreshold = 0.45f;
+    const float ballConfThreshold = 0.30f;  // top icin daha yuksek esik (yanlış pozitif azaltir)
+    const int minBallSizePx = 8;            // bu pikselden kucuk tespit top olamaz
+    const int maxBallSizePx = 80;           // bu pikselden buyuk tespit top olamaz
 
     cv::VideoWriter writer(
         outputVideoPath,
@@ -486,7 +520,10 @@ int main(int argc, char** argv) {
                 if (isHumanClass(mappedClassId, classMapping)) {
                     ++totalHumanDetections;
                     raw.humans.push_back(HumanDetection{-1, mappedClassId, det.confidence, det.box, false});
-                } else if (mappedClassId == classMapping.ballId) {
+                } else if (mappedClassId == classMapping.ballId
+                           && det.confidence >= ballConfThreshold
+                           && det.box.width  >= minBallSizePx && det.box.width  <= maxBallSizePx
+                           && det.box.height >= minBallSizePx && det.box.height <= maxBallSizePx) {
                     if (!raw.ball.has_value() || det.confidence > raw.ball->confidence) {
                         raw.ball = Detection{mappedClassId, det.confidence, det.box};
                     }
@@ -533,9 +570,7 @@ int main(int argc, char** argv) {
     //   iouHighThresh = 0.15 : 20x20px top 1.5x boyutu kadar kayarsa hala eslesir
     //   iouLowThresh  = 0.08 : ikinci asama icin
     //   maxLost       = 5    : 5 frame kayip sonra track silinir (interpolasyon devralir)
-    fa::ByteTrackLite ballTracker(0.30f, 0.10f, 0.15f, 0.08f, 5);
-
-    fa::HomographyTransformer homography;
+    fa::ByteTrackLite ballTracker(0.30f, 0.10f, 0.15f, 0.08f, 2);
 
     for (std::size_t i = 0; i < frames.size(); ++i) {
         auto humans = rawPerFrame[i].humans;
@@ -584,23 +619,25 @@ int main(int argc, char** argv) {
             ball = Detection{trackedBalls[0].classId, trackedBalls[0].confidence, restoredBox};
         }
 
-        // Homografi: her oyuncu icin saha koordinatini hesapla.
+        // Homografi: verilmisse oyuncu ve top icin saha koordinatlarini hesapla.
         WorldPosMap worldMap;
-        for (const auto& h : tracked) {
-            const float footX = static_cast<float>(h.box.x + h.box.width / 2);
-            const float footY = static_cast<float>(h.box.y + h.box.height);
-            const fa::Point2f adjustedPos{footX - cameraMotion[i].x, footY - cameraMotion[i].y};
-            worldMap[h.trackId] = homography.toWorld(adjustedPos);
+        if (homography.has_value()) {
+            for (const auto& h : tracked) {
+                const float footX = static_cast<float>(h.box.x + h.box.width / 2);
+                const float footY = static_cast<float>(h.box.y + h.box.height);
+                const fa::Point2f adjustedPos{footX - cameraMotion[i].x, footY - cameraMotion[i].y};
+                worldMap[h.trackId] = homography->toWorld(adjustedPos);
+            }
         }
         worldPosPerFrame.push_back(std::move(worldMap));
 
-        // Top icin saha koordinati
+        // Top icin saha koordinati (sadece homografi aktifse)
         std::optional<fa::Point2f> ballWorld;
-        if (ball.has_value()) {
+        if (ball.has_value() && homography.has_value()) {
             const float cx = static_cast<float>(ball->box.x + ball->box.width / 2);
             const float cy = static_cast<float>(ball->box.y + ball->box.height / 2);
             const fa::Point2f adjustedPos{cx - cameraMotion[i].x, cy - cameraMotion[i].y};
-            ballWorld = homography.toWorld(adjustedPos);
+            ballWorld = homography->toWorld(adjustedPos);
         }
         ballWorldPerFrame.push_back(ballWorld);
 

@@ -14,7 +14,6 @@ cpp_port/Makefile
 
 # Local binary assets (keep placeholder text files)
 models/*.onnx
-cpp_port/models/*.onnx
 input_videos/*.mp4
 output_videos/*.mp4
 cpp_port/*.mp4
