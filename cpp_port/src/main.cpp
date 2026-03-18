@@ -524,46 +524,67 @@ int main(int argc, char** argv) {
     std::vector<WorldPosMap> worldPosPerFrame;
     std::vector<std::optional<fa::Point2f>> ballWorldPerFrame;
 
-    fa::ByteTrackLite humanTracker(0.45f, 0.10f, 0.30f, 0.20f, 30);
+    // Oncelik 3: IOU esikleri ayarla.
+    // Oyuncu tracker: iouHighThresh 0.30 → 0.20 (onceki degerde cok ID kaybi yasaniyordu)
+    fa::ByteTrackLite humanTracker(0.45f, 0.10f, 0.20f, 0.15f, 30);
+
+    // Top tracker: cok daha dusuk IOU esikleri — top kucuk oldugu icin iki frame
+    // arasindaki IOU hizli harekette 0.15'in altina dusuyor.
+    //   iouHighThresh = 0.15 : 20x20px top 1.5x boyutu kadar kayarsa hala eslesir
+    //   iouLowThresh  = 0.08 : ikinci asama icin
+    //   maxLost       = 5    : 5 frame kayip sonra track silinir (interpolasyon devralir)
+    fa::ByteTrackLite ballTracker(0.30f, 0.10f, 0.15f, 0.08f, 5);
+
     fa::HomographyTransformer homography;
 
     for (std::size_t i = 0; i < frames.size(); ++i) {
         auto humans = rawPerFrame[i].humans;
-        auto ball = rawPerFrame[i].ball;
+        const auto& rawBall = rawPerFrame[i].ball;
 
         // Kamera deplasmanini tespit kutularindan cikar (piksel olarak yuvarla)
         const int dxi = static_cast<int>(std::round(cameraMotion[i].x));
         const int dyi = static_cast<int>(std::round(cameraMotion[i].y));
 
+        // İnsan tespitlerini kompanze et
         if (dxi != 0 || dyi != 0) {
             for (auto& h : humans) {
                 h.box.x -= dxi;
                 h.box.y -= dyi;
             }
-            if (ball.has_value()) {
-                ball->box.x -= dxi;
-                ball->box.y -= dyi;
-            }
+        }
+
+        // Top tespitini kompanze edip ball tracker'a ver
+        std::vector<HumanDetection> ballDets;
+        if (rawBall.has_value()) {
+            cv::Rect compensatedBox = rawBall->box;
+            compensatedBox.x -= dxi;
+            compensatedBox.y -= dyi;
+            ballDets.push_back(HumanDetection{-1, classMapping.ballId, rawBall->confidence, compensatedBox, false});
         }
 
         // ByteTrack: kompanze edilmis koordinatlar uzerinde calistir
         auto tracked = humanTracker.update(humans);
+        const auto trackedBalls = ballTracker.update(ballDets);
 
-        // Goruntu cizimleri icin orijinal frame koordinatlarına geri al
+        // Goruntu cizimleri icin orijinal frame koordinatlarına geri al (insanlar)
         if (dxi != 0 || dyi != 0) {
             for (auto& h : tracked) {
                 h.box.x += dxi;
                 h.box.y += dyi;
             }
-            if (ball.has_value()) {
-                ball->box.x += dxi;
-                ball->box.y += dyi;
-            }
+        }
+
+        // Top tracker ciktisini orijinal koordinatlara cevir.
+        // ballTracker kayip frame'lerde bos dondurur → interpolasyon devralir.
+        std::optional<Detection> ball;
+        if (!trackedBalls.empty()) {
+            cv::Rect restoredBox = trackedBalls[0].box;
+            restoredBox.x += dxi;
+            restoredBox.y += dyi;
+            ball = Detection{trackedBalls[0].classId, trackedBalls[0].confidence, restoredBox};
         }
 
         // Homografi: her oyuncu icin saha koordinatini hesapla.
-        // Python: position_adjusted = position - camera_movement
-        // Burada position_adjusted = orijinal konum - cameraMotion[i] (float degerle)
         WorldPosMap worldMap;
         for (const auto& h : tracked) {
             const float footX = static_cast<float>(h.box.x + h.box.width / 2);
@@ -573,7 +594,7 @@ int main(int argc, char** argv) {
         }
         worldPosPerFrame.push_back(std::move(worldMap));
 
-        // Top icin saha koordinati (merkez noktasi kullanilir)
+        // Top icin saha koordinati
         std::optional<fa::Point2f> ballWorld;
         if (ball.has_value()) {
             const float cx = static_cast<float>(ball->box.x + ball->box.width / 2);
