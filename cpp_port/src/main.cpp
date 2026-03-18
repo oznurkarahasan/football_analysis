@@ -9,6 +9,7 @@
 
 #include "football_analysis/byte_track_lite.hpp"
 #include "football_analysis/camera_motion_estimator.hpp"
+#include "football_analysis/homography_transformer.hpp"
 
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
@@ -508,15 +509,23 @@ int main(int argc, char** argv) {
     fa::CameraMotionEstimator cameraEstimator;
     const std::vector<cv::Point2f> cameraMotion = cameraEstimator.estimate(frames);
 
-    // --- 3. GECiS: Kamera kompanzasyonu + ByteTrack + top sahipligi ---
+    // --- 3. GECiS: Kamera kompanzasyonu + ByteTrack + Homografi + top sahipligi ---
     // Tespit kutularini kamera hareketine gore duzelttikten sonra tracker'a ver.
     // ByteTrack kamera sapması olmadan tutarli IOU eslesmeleri yapabilsin.
     // Goruntu cizimi icin kutular orijinal koordinatlara geri cevrilir.
+    // Homografi ile saha (dunya) koordinatlari hesaplanir.
 
     std::vector<std::vector<HumanDetection>> humansPerFrame;
     std::vector<std::optional<Detection>> ballPerFrame;
 
+    // Per-frame world position haritasi: trackId → saha koordinati (metre)
+    // std::nullopt: oyuncu saha polygon'u disinda
+    using WorldPosMap = std::unordered_map<int, std::optional<fa::Point2f>>;
+    std::vector<WorldPosMap> worldPosPerFrame;
+    std::vector<std::optional<fa::Point2f>> ballWorldPerFrame;
+
     fa::ByteTrackLite humanTracker(0.45f, 0.10f, 0.30f, 0.20f, 30);
+    fa::HomographyTransformer homography;
 
     for (std::size_t i = 0; i < frames.size(); ++i) {
         auto humans = rawPerFrame[i].humans;
@@ -552,6 +561,28 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Homografi: her oyuncu icin saha koordinatini hesapla.
+        // Python: position_adjusted = position - camera_movement
+        // Burada position_adjusted = orijinal konum - cameraMotion[i] (float degerle)
+        WorldPosMap worldMap;
+        for (const auto& h : tracked) {
+            const float footX = static_cast<float>(h.box.x + h.box.width / 2);
+            const float footY = static_cast<float>(h.box.y + h.box.height);
+            const fa::Point2f adjustedPos{footX - cameraMotion[i].x, footY - cameraMotion[i].y};
+            worldMap[h.trackId] = homography.toWorld(adjustedPos);
+        }
+        worldPosPerFrame.push_back(std::move(worldMap));
+
+        // Top icin saha koordinati (merkez noktasi kullanilir)
+        std::optional<fa::Point2f> ballWorld;
+        if (ball.has_value()) {
+            const float cx = static_cast<float>(ball->box.x + ball->box.width / 2);
+            const float cy = static_cast<float>(ball->box.y + ball->box.height / 2);
+            const fa::Point2f adjustedPos{cx - cameraMotion[i].x, cy - cameraMotion[i].y};
+            ballWorld = homography.toWorld(adjustedPos);
+        }
+        ballWorldPerFrame.push_back(ballWorld);
+
         // Top sahipligi atamasi (orijinal koordinatlarla)
         if (ball.has_value()) {
             const int assignedTrack = assignBallToClosestPlayer(tracked, ball->box, classMapping.playerId, 70.0f);
@@ -571,18 +602,58 @@ int main(int argc, char** argv) {
 
     interpolateBallDetections(ballPerFrame);
 
+    int totalWorldPositions = 0;
+
     for (std::size_t i = 0; i < frames.size(); ++i) {
         auto& outFrame = frames[i];
+        const WorldPosMap& worldMap = worldPosPerFrame[i];
+
         for (const auto& human : humansPerFrame[i]) {
             const cv::Scalar color = classColor(human.classId, classMapping);
             drawPlayerEllipse(outFrame, human.box, color, human.trackId);
             if (human.hasBall) {
                 drawBallTriangle(outFrame, human.box, cv::Scalar(0, 0, 255));
             }
+
+            // Saha koordinatini oyuncunun altina yaz (saha icindeyse)
+            const auto it = worldMap.find(human.trackId);
+            if (it != worldMap.end() && it->second.has_value()) {
+                ++totalWorldPositions;
+                const fa::Point2f& wp = it->second.value();
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%.1f,%.1f", wp.x, wp.y);
+                const int xCenter = human.box.x + human.box.width / 2;
+                const int y2 = human.box.y + human.box.height;
+                cv::putText(
+                    outFrame,
+                    buf,
+                    cv::Point(xCenter - 18, y2 + 42),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.40,
+                    cv::Scalar(0, 255, 255),  // sari-yesil (cyan)
+                    1);
+            }
         }
 
         if (ballPerFrame[i].has_value()) {
             drawBallTriangle(outFrame, ballPerFrame[i]->box, classColor(classMapping.ballId, classMapping));
+
+            // Top saha koordinatini topun yanina yaz
+            if (ballWorldPerFrame[i].has_value()) {
+                const fa::Point2f& wp = ballWorldPerFrame[i].value();
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%.1f,%.1f", wp.x, wp.y);
+                const int bx = ballPerFrame[i]->box.x + ballPerFrame[i]->box.width / 2;
+                const int by = ballPerFrame[i]->box.y;
+                cv::putText(
+                    outFrame,
+                    buf,
+                    cv::Point(bx + 8, by - 8),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.40,
+                    cv::Scalar(0, 255, 0),  // yesil
+                    1);
+            }
         }
 
         writer.write(outFrame);
@@ -591,6 +662,7 @@ int main(int argc, char** argv) {
     std::cout << "Islenen frame sayisi: " << frames.size() << "\n";
     std::cout << "Top tespit sayisi: " << totalBallDetections << "\n";
     std::cout << "Insan tespit sayisi: " << totalHumanDetections << "\n";
+    std::cout << "Dunya koordinati hesaplanan: " << totalWorldPositions << " tespit\n";
     std::cout << "Cikti videosu: " << outputVideoPath << "\n";
     return 0;
 }

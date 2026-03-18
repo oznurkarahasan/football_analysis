@@ -4,6 +4,7 @@ project(football_analysis_cpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio dnn video)
 
@@ -13,6 +14,7 @@ add_library(football_analysis_core
     src/speed_distance_estimator.cpp
     src/pipeline.cpp
     src/camera_motion_estimator.cpp
+    src/homography_transformer.cpp
 )
 
 target_include_directories(football_analysis_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
